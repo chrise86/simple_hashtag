@@ -139,6 +139,103 @@ module SimpleHashtag
         connection.respond_to?(:unprepared_statement) ? connection.unprepared_statement{relation.to_sql} : relation.to_sql
       end
 
+      ##
+      # Return a scope of objects that are tagged with the specified tags.
+      #
+      # @param tags The tags that we want to query for
+      # @param [Hash] options A hash of options to alter you query:
+      #                       * <tt>:exclude</tt> - if set to true, return objects that are *NOT* tagged with the specified tags
+      #                       * <tt>:any</tt> - if set to true, return objects that are tagged with *ANY* of the specified tags
+      #                       * <tt>:order_by_matching_tag_count</tt> - if set to true and used with :any, sort by objects matching the most tags, descending
+      #                       * <tt>:match_all</tt> - if set to true, return objects that are *ONLY* tagged with the specified tags
+      #
+      # Example:
+      #   User.tagged_with("awesome", "cool")                     # Users that are tagged with awesome and cool
+      #   User.tagged_with("awesome", "cool", :exclude => true)   # Users that are not tagged with awesome or cool
+      #   User.tagged_with("awesome", "cool", :any => true)       # Users that are tagged with awesome or cool
+      #   User.tagged_with("awesome", "cool", :any => true, :order_by_matching_tag_count => true)  # Sort by users who match the most tags, descending
+      #   User.tagged_with("awesome", "cool", :match_all => true) # Users that are tagged with just awesome and cool
+      def tagged_with(tags, options = {})
+        tag_list = SimpleHashtag::TagList.from(tags)
+        empty_result = where("1 = 0")
+
+        return empty_result if tag_list.empty?
+
+        joins = []
+        conditions = []
+        having = []
+        select_clause = []
+        order_by = []
+
+        context = options.delete(:on)
+        alias_base_name = undecorated_table_name.gsub('.','_')
+        quote = connection && connection.adapter_name == 'PostgreSQL' ? '"' : ''
+
+        if options.delete(:exclude)
+          if options.delete(:wild)
+            tags_conditions = tag_list.map { |t| sanitize_sql(["#{SimpleHashtag::Hashtag.table_name}.name #{like_operator} ? ESCAPE '!'", "%#{escape_like(t)}%"]) }.join(" OR ")
+          else
+            tags_conditions = tag_list.map { |t| sanitize_sql(["#{SimpleHashtag::Hashtag.table_name}.name #{like_operator} ?", t]) }.join(" OR ")
+          end
+
+          conditions << "#{table_name}.#{primary_key} NOT IN (SELECT #{SimpleHashtag::Hashtagging.table_name}.hashtaggable_id FROM #{SimpleHashtag::Hashtagging.table_name} JOIN #{SimpleHashtag::Hashtag.table_name} ON #{SimpleHashtag::Hashtagging.table_name}.hashtag_id = #{SimpleHashtag::Hashtag.table_name}.#{SimpleHashtag::Hashtag.primary_key} AND (#{tags_conditions}) WHERE #{SimpleHashtag::Hashtagging.table_name}.hashtaggable_type = #{quote_value(base_class.name, nil)})"
+
+        else
+          tags = SimpleHashtag::Hashtag.named_any(tag_list)
+
+          return empty_result unless tags.length == tag_list.length
+
+          tags.each do |tag|
+            taggings_alias = adjust_taggings_alias("#{alias_base_name[0..11]}_taggings_#{Digest::SHA1.hexdigest("#{tag.name}#{rand}")[0..6]}")
+            tagging_join  = "JOIN #{SimpleHashtag::Hashtagging.table_name} #{taggings_alias}" +
+                            "  ON #{taggings_alias}.hashtaggable_id = #{quote}#{table_name}#{quote}.#{primary_key}" +
+                            " AND #{taggings_alias}.hashtaggable_type = #{quote_value(base_class.name, nil)}" +
+                            " AND #{taggings_alias}.hashtag_id = #{quote_value(tag.id, nil)}"
+
+            joins << tagging_join
+          end
+        end
+
+        group = [] # Rails interprets this as a no-op in the group() call below
+        if options.delete(:order_by_matching_tag_count)
+          select_clause = "#{table_name}.*, COUNT(#{taggings_alias}.hashtag_id) AS #{taggings_alias}_count"
+          group_columns = SimpleHashtag::Hashtag.using_postgresql? ? grouped_column_names_for(self) : "#{table_name}.#{primary_key}"
+          group = group_columns
+          order_by << "#{taggings_alias}_count DESC"
+
+        elsif options.delete(:match_all)
+          taggings_alias, _ = adjust_taggings_alias("#{alias_base_name}_taggings_group"), "#{alias_base_name}_tags_group"
+          joins << "LEFT OUTER JOIN #{SimpleHashtag::Hashtagging.table_name} #{taggings_alias}" +
+                   "  ON #{taggings_alias}.hashtaggable_id = #{quote}#{table_name}#{quote}.#{primary_key}" +
+                   " AND #{taggings_alias}.hashtaggable_type = #{quote_value(base_class.name, nil)}"
+
+          joins << " AND " + sanitize_sql(["#{taggings_alias}.context = ?", context.to_s]) if context
+
+          group_columns = SimpleHashtag::Hashtag.using_postgresql? ? grouped_column_names_for(self) : "#{table_name}.#{primary_key}"
+          group = group_columns
+          having = "COUNT(#{taggings_alias}.hashtaggable_id) = #{tags.size}"
+        end
+
+        order_by << options[:order] if options[:order].present?
+
+        request = select(select_clause).
+          joins(joins.join(" ")).
+          where(conditions.join(" AND ")).
+          group(group).
+          having(having).
+          order(order_by.join(", ")).
+          readonly(false)
+
+        ((context and tag_types.one?) && options.delete(:any)) ? request : request.uniq
+      end
+
+      def adjust_taggings_alias(taggings_alias)
+        if taggings_alias.size > 75
+          taggings_alias = 'taggings_alias_' + Digest::SHA1.hexdigest(taggings_alias)
+        end
+        taggings_alias
+      end
+
       private
 
       def tagging_conditions(options)
