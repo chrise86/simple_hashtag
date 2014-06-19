@@ -156,7 +156,9 @@ module SimpleHashtag
       #   User.tagged_with("awesome", "cool", :any => true, :order_by_matching_tag_count => true)  # Sort by users who match the most tags, descending
       #   User.tagged_with("awesome", "cool", :match_all => true) # Users that are tagged with just awesome and cool
       def tagged_with(tags, options = {})
-        tag_list = SimpleHashtag::TagList.from(tags)
+        # tag_list = SimpleHashtag::TagList.from(tags)
+        tag_list = SimpleHashtag::TagListParser.parse(tags)
+        options = options.dup
         empty_result = where("1 = 0")
 
         return empty_result if tag_list.empty?
@@ -179,6 +181,43 @@ module SimpleHashtag
           end
 
           conditions << "#{table_name}.#{primary_key} NOT IN (SELECT #{SimpleHashtag::Hashtagging.table_name}.hashtaggable_id FROM #{SimpleHashtag::Hashtagging.table_name} JOIN #{SimpleHashtag::Hashtag.table_name} ON #{SimpleHashtag::Hashtagging.table_name}.hashtag_id = #{SimpleHashtag::Hashtag.table_name}.#{SimpleHashtag::Hashtag.primary_key} AND (#{tags_conditions}) WHERE #{SimpleHashtag::Hashtagging.table_name}.hashtaggable_type = #{quote_value(base_class.name, nil)})"
+
+        elsif any = options.delete(:any)
+          # get tags, drop out if nothing returned (we need at least one)
+          tags = if options.delete(:wild)
+                   SimpleHashtag::Hashtag.named_like_any(tag_list)
+                 else
+                   SimpleHashtag::Hashtag.named_any(tag_list)
+                 end
+
+          return empty_result unless tags.length > 0
+
+          # setup taggings alias so we can chain, ex: items_locations_taggings_awesome_cool_123
+          # avoid ambiguous column name
+          taggings_context = context ? "_#{context}" : ''
+
+          taggings_alias = adjust_taggings_alias(
+              "#{alias_base_name[0..4]}#{taggings_context[0..6]}_taggings_#{Digest::SHA1.hexdigest(tags.map(&:name).join('_'))}"
+          )
+
+          tagging_join = "JOIN #{SimpleHashtag::Hashtagging.table_name} #{taggings_alias}" +
+                          "  ON #{taggings_alias}.hashtaggable_id = #{quote}#{table_name}#{quote}.#{primary_key}" +
+                          " AND #{taggings_alias}.hashtaggable_type = #{quote_value(base_class.name, nil)}"
+
+          tagging_join << " AND " + sanitize_sql(["#{taggings_alias}.created_at >= ?", options.delete(:start_at)]) if options[:start_at]
+          tagging_join << " AND " + sanitize_sql(["#{taggings_alias}.created_at <= ?", options.delete(:end_at)])   if options[:end_at]
+
+          tagging_join << " AND " + sanitize_sql(["#{taggings_alias}.context = ?", context.to_s]) if context
+
+          # don't need to sanitize sql, map all ids and join with OR logic
+          conditions << tags.map { |t| "#{taggings_alias}.hashtag_id = #{quote_value(t.id, nil)}" }.join(' OR ')
+          select_clause << " #{table_name}.*" unless context and tag_types.one?
+
+          joins << tagging_join
+          unless any == 'distinct' # Fix issue #544
+            group = "#{table_name}.#{primary_key}"
+            select_clause << group
+          end
 
         else
           tags = SimpleHashtag::Hashtag.named_any(tag_list)
